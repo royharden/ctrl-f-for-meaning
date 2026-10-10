@@ -1,0 +1,11 @@
+[functions.jev-search]
+verify_jwt = false
+entrypoint = "./functions/jev-search/index.ts"
+
+[functions.answer]
+verify_jwt = false
+entrypoint = "./functions/answer/index.ts"
+
+[functions.embed-search]
+verify_jwt = false
+entrypoint = "./functions/embed-search/index.ts"
