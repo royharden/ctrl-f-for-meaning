@@ -1,6 +1,7 @@
 import type { DocLine, DocSection, Window } from '@/types';
 import {
   MAX_LINE_CHARS,
+  MAX_STATE_CHARS,
   MAX_WINDOW_LINES,
   MAX_WINDOW_TOKENS,
 } from '@/types';
@@ -133,6 +134,10 @@ export function splitIntoWindows(lines: DocLine[]): Window[] {
     while (tokenEst > MAX_WINDOW_TOKENS && end > i + 1) {
       end--;
       tokenEst = estimateWindowTokens(lines.slice(i, end));
+    }
+    // The tagged state must also fit jev-search's server-side state limit.
+    while (linesToTaggedString(lines.slice(i, end)).length > MAX_STATE_CHARS && end > i + 1) {
+      end--;
     }
     windows.push({ lines: lines.slice(i, end), startIdx: i, endIdx: end - 1 });
     i = end;

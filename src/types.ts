@@ -123,7 +123,11 @@ export const JEV_MODEL = 'jev-1.13.0';
 export const JEV_COST_PER_M_INPUT = 0.042;
 export const EMBED_COST_PER_M_INPUT = 0.02;
 export const MAX_WINDOW_LINES = 250;
-export const MAX_WINDOW_TOKENS = 24000;
+// Keeps a tagged window under jev-search's MAX_STATE_CHARS (~4 chars/token).
+export const MAX_WINDOW_TOKENS = 14000;
+export const MAX_STATE_CHARS = 60000;
+export const MAX_QUERY_CHARS = 500;
+export const MAX_EMBED_LINES = 2000;
 export const MAX_LINE_CHARS = 400;
 export const MAX_SECTION_KEEP = 3;
 export const SECTION_PROB_CUTOFF = 0.9;

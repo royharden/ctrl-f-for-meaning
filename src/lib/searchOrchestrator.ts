@@ -9,7 +9,10 @@ import type {
   SearchRecord,
 } from '@/types';
 import { EMBED_COST_PER_M_INPUT } from '@/types';
-import { callJevSearch, callAnswer, callEmbedSearch, verdictSentenceFor } from '@/lib/edgeClient';
+import {
+  callJevSearch, callAnswer, callEmbedSearch, verdictSentenceFor,
+  isDemoLimitError, saveDocument, saveSearch,
+} from '@/lib/edgeClient';
 import { bm25Rank, fallbackExists, tfidfCosineRank } from '@/lib/fallback';
 import { findFixture } from '@/fixtures/recorded';
 import { computeVerdict } from '@/lib/verdict';
@@ -42,11 +45,13 @@ export interface SearchOutcome {
   isFallback: boolean;
   searchRecord: SearchRecord | null;
   warning: string | null;
+  /** Friendly, non-error notice (e.g. the daily demo limit was reached). */
+  notice: string | null;
   docDbId: string | null;
 }
 
 export async function runSearch(params: SearchParams): Promise<SearchOutcome> {
-  const { lines, sections, query, thresholds, compareEmbeddings, writerMode, offlineReplay, docSourceId, docDbId, docTitle, docSource, docIsSample, docTokenEstimate } = params;
+  const { lines, sections, query, thresholds, compareEmbeddings, writerMode, offlineReplay, docSourceId, docDbId, docTitle, docSource, docIsSample } = params;
 
   // Try offline replay first if enabled
   if (offlineReplay) {
@@ -58,18 +63,25 @@ export async function runSearch(params: SearchParams): Promise<SearchOutcome> {
   let isFallback = false;
   let isReplay = false;
   let warning: string | null = null;
+  let notice: string | null = null;
+  // Set once any edge function reports the daily demo cap: from then on no
+  // more paid calls are made for this search.
+  let demoMode = false;
+  const fixture = findFixture(query, docSourceId);
 
   try {
     result = await callJevSearch({ lines, sections, query });
   } catch (err) {
     const errMsg = err instanceof Error ? err.message : 'Unknown error';
-    warning = `Jev search failed: ${errMsg}. Showing fallback results.`;
+    if (isDemoLimitError(err)) {
+      demoMode = true;
+      notice = err.message;
+    }
     // Try recorded fixture
-    const fixture = findFixture(query, docSourceId);
     if (fixture) {
       result = { ...fixture.jev, mode: 'replay' };
       isReplay = true;
-      warning = `Jev search failed: ${errMsg}. Showing recorded replay.`;
+      if (!demoMode) warning = `Jev search failed: ${errMsg}. Showing recorded replay.`;
     } else {
       // Fallback to BM25
       const topLines = bm25Rank(lines, query);
@@ -87,11 +99,16 @@ export async function runSearch(params: SearchParams): Promise<SearchOutcome> {
         mode: 'fallback',
       };
       isFallback = true;
+      if (!demoMode) warning = `Jev search failed: ${errMsg}. Showing fallback results.`;
     }
   }
 
   // Get baseline if requested
-  if (compareEmbeddings && !isFallback) {
+  if (compareEmbeddings && isFallback) {
+    baseline = tfidfBaseline(lines, query);
+  } else if (compareEmbeddings && demoMode) {
+    baseline = fixture?.baseline ?? tfidfBaseline(lines, query);
+  } else if (compareEmbeddings) {
     try {
       if (docDbId) {
         baseline = await callEmbedSearch({
@@ -101,23 +118,22 @@ export async function runSearch(params: SearchParams): Promise<SearchOutcome> {
         });
       }
     } catch (err) {
-      const errMsg = err instanceof Error ? err.message : 'Unknown error';
-      warning = warning ?? `Embeddings baseline failed: ${errMsg}. Showing TF-IDF fallback.`;
+      if (isDemoLimitError(err)) {
+        demoMode = true;
+        notice = notice ?? err.message;
+      } else {
+        const errMsg = err instanceof Error ? err.message : 'Unknown error';
+        warning = warning ?? `Embeddings baseline failed: ${errMsg}. Showing TF-IDF fallback.`;
+      }
       baseline = tfidfBaseline(lines, query);
     }
-  } else if (compareEmbeddings && isFallback) {
-    baseline = tfidfBaseline(lines, query);
   }
 
   const verdict = computeVerdict(result.exists, thresholds);
 
   // Get answer
   let answer: string;
-  if (isFallback) {
-    answer = mockAnswerFromLines(query, verdict, result.topLines);
-  } else if (writerMode === 'mock') {
-    answer = mockAnswerFromLines(query, verdict, result.topLines);
-  } else if (writerMode === 'offline') {
+  if (isFallback || demoMode || writerMode === 'mock' || writerMode === 'offline') {
     answer = mockAnswerFromLines(query, verdict, result.topLines);
   } else {
     try {
@@ -138,98 +154,54 @@ export async function runSearch(params: SearchParams): Promise<SearchOutcome> {
         writerMode: 'live',
       });
     } catch (err) {
-      const errMsg = err instanceof Error ? err.message : 'Unknown error';
-      warning = warning ?? `LLM writer failed: ${errMsg}. Showing extractive answer.`;
+      if (isDemoLimitError(err)) {
+        demoMode = true;
+        notice = notice ?? err.message;
+      } else {
+        const errMsg = err instanceof Error ? err.message : 'Unknown error';
+        warning = warning ?? `LLM writer failed: ${errMsg}. Showing extractive answer.`;
+      }
       answer = mockAnswerFromLines(query, verdict, result.topLines);
     }
   }
 
-  // Persist to database — upsert document first to satisfy the FK on searches
+  // Persist via the `persist` edge function. Insert the document once (only if
+  // we don't already have its id), then reuse that id for the search row.
   let searchRecord: SearchRecord | null = null;
   let resolvedDocDbId = docDbId;
   try {
     if (!resolvedDocDbId) {
-      const { data: docData, error: docErr } = await supabase
-        .from('documents')
-        .insert({
-          title: docTitle,
-          source: docSource,
-          is_sample: docIsSample,
-          line_count: lines.length,
-          token_estimate: docTokenEstimate,
-          lines,
-          sections,
-        })
-        .select('id')
-        .maybeSingle();
-      if (!docErr && docData) {
-        resolvedDocDbId = docData.id;
-      }
-    } else {
-      const { error: docErr } = await supabase
-        .from('documents')
-        .upsert({
-          id: resolvedDocDbId,
-          title: docTitle,
-          source: docSource,
-          is_sample: docIsSample,
-          line_count: lines.length,
-          token_estimate: docTokenEstimate,
-          lines,
-          sections,
-        }, { onConflict: 'id' });
-      if (docErr) {
-        // upsert failed — try a fresh insert instead
-        const { data: docData, error: docErr2 } = await supabase
-          .from('documents')
-          .insert({
-            title: docTitle,
-            source: docSource,
-            is_sample: docIsSample,
-            line_count: lines.length,
-            token_estimate: docTokenEstimate,
-            lines,
-            sections,
-          })
-          .select('id')
-          .maybeSingle();
-        if (!docErr2 && docData) {
-          resolvedDocDbId = docData.id;
-        }
-      }
+      resolvedDocDbId = await saveDocument({
+        title: docTitle,
+        source: docSource,
+        isSample: docIsSample,
+        lines,
+        sections,
+      });
     }
 
-    if (resolvedDocDbId) {
-      const { data, error } = await supabase
-        .from('searches')
-        .insert({
-          document_id: resolvedDocDbId,
-          query,
-          mode: isReplay ? 'replay' : isFallback ? 'fallback' : result.mode,
-          exists_p: result.exists,
-          verdict,
-          top_lines: result.topLines,
-          jev_requests: result.requests,
-          jev_responses: result.responses,
-          model: result.model,
-          latency_ms: result.latencyMs,
-          input_tokens: result.usage.input_tokens,
-          cost_usd: result.costUsd,
-          answer,
-          writer_mode: isFallback ? 'mock' : writerMode,
-          baseline: baseline ?? {},
-        })
-        .select('*')
-        .maybeSingle();
-      if (!error && data) {
-        searchRecord = data as SearchRecord;
-      }
-    }
+    searchRecord = await saveSearch({
+      document_id: resolvedDocDbId,
+      query,
+      mode: isReplay ? 'replay' : isFallback ? 'fallback' : result.mode,
+      exists_p: result.exists,
+      verdict,
+      top_lines: result.topLines,
+      jev_requests: result.requests,
+      jev_responses: result.responses,
+      model: result.model,
+      latency_ms: result.latencyMs,
+      input_tokens: result.usage.input_tokens,
+      cost_usd: result.costUsd,
+      answer,
+      writer_mode: isFallback || demoMode ? 'mock' : writerMode,
+      baseline: baseline ?? {},
+    });
   } catch {
     // Persist failure is non-fatal
   }
 
-  return { result, baseline, verdict, answer, isReplay, isFallback, searchRecord, warning, docDbId: resolvedDocDbId };
+  return { result, baseline, verdict, answer, isReplay, isFallback, searchRecord, warning, notice, docDbId: resolvedDocDbId };
 }
 
 async function replaySearch(params: SearchParams): Promise<SearchOutcome> {
@@ -246,7 +218,7 @@ async function replaySearch(params: SearchParams): Promise<SearchOutcome> {
       baseline = fixture.baseline;
     }
 
-    return { result, baseline, verdict, answer, isReplay: true, isFallback: false, searchRecord: null, warning: null, docDbId: params.docDbId ?? null };
+    return { result, baseline, verdict, answer, isReplay: true, isFallback: false, searchRecord: null, warning: null, notice: null, docDbId: params.docDbId ?? null };
   }
 
   // No fixture for this query — use fallback
@@ -268,7 +240,7 @@ async function replaySearch(params: SearchParams): Promise<SearchOutcome> {
   const answer = mockAnswerFromLines(query, verdict, result.topLines);
   const baseline = compareEmbeddings ? tfidfBaseline(lines, query) : null;
 
-  return { result, baseline, verdict, answer, isReplay: false, isFallback: true, searchRecord: null, warning: null, docDbId: params.docDbId ?? null };
+  return { result, baseline, verdict, answer, isReplay: false, isFallback: true, searchRecord: null, warning: null, notice: null, docDbId: params.docDbId ?? null };
 }
 
 function mockAnswerFromLines(

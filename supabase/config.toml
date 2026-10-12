@@ -1,11 +1,15 @@
 [functions.jev-search]
-verify_jwt = false
+verify_jwt = true
 entrypoint = "./functions/jev-search/index.ts"
 
 [functions.answer]
-verify_jwt = false
+verify_jwt = true
 entrypoint = "./functions/answer/index.ts"
 
 [functions.embed-search]
-verify_jwt = false
+verify_jwt = true
 entrypoint = "./functions/embed-search/index.ts"
+
+[functions.persist]
+verify_jwt = true
+entrypoint = "./functions/persist/index.ts"

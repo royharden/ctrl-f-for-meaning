@@ -20,7 +20,8 @@ import {
 import type { SearchRecord } from '@/types';
 import { sampleDocuments, presetQueries, type SampleDoc } from '@/data/sampleDocuments';
 import { extractPdfText } from '@/lib/pdfExtract';
-import { supabase } from '@/lib/supabase';
+import { saveDocument } from '@/lib/edgeClient';
+import { MAX_QUERY_CHARS } from '@/types';
 
 type DocSource =
   | { type: 'sample'; doc: SampleDoc }
@@ -82,25 +83,15 @@ export default function App() {
 
   const persistDoc = async (doc: PreparedDoc, isSample: boolean) => {
     try {
-      const { data, error } = await supabase
-        .from('documents')
-        .insert({
-          title: doc.title,
-          source: doc.source,
-          is_sample: isSample,
-          line_count: doc.lines.length,
-          token_estimate: doc.tokenEstimate,
-          lines: doc.lines,
-          sections: doc.sections,
-        })
-        .select('id')
-        .maybeSingle();
-      if (!error && data) {
-        setDocDbId(data.id);
-        await refreshHistory(data.id);
-      } else {
-        setDocDbId(null);
-      }
+      const id = await saveDocument({
+        title: doc.title,
+        source: doc.source,
+        isSample,
+        lines: doc.lines,
+        sections: doc.sections,
+      });
+      setDocDbId(id);
+      await refreshHistory(id);
     } catch {
       setDocDbId(null);
     }
@@ -262,6 +253,15 @@ export default function App() {
         <div className="max-w-5xl mx-auto px-6 py-3">
           <div className="bg-red-50 border border-red-200 text-red-700 rounded-lg px-4 py-3 text-sm">
             {error}
+          </div>
+        </div>
+      )}
+
+      {outcome?.notice && (
+        <div className="max-w-5xl mx-auto px-6 py-2">
+          <div className="bg-sky-50 border border-sky-200 text-sky-800 rounded-lg px-4 py-2.5 text-sm flex items-start gap-2">
+            <Info className="w-4 h-4 shrink-0 mt-0.5 text-sky-500" />
+            <span>{outcome.notice}</span>
           </div>
         </div>
       )}
@@ -557,6 +557,7 @@ function SearchBar({
               value={query}
               onChange={(e) => setQuery(e.target.value)}
               onKeyDown={(e) => { if (e.key === 'Enter' && !searching) onSearch(); }}
+              maxLength={MAX_QUERY_CHARS}
               placeholder="Ask a plain-language question about the document..."
               className="w-full pl-11 pr-4 py-3 text-sm rounded-lg border border-slate-200 focus:border-sky-400 focus:ring-2 focus:ring-sky-100 focus:outline-none"
             />

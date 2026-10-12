@@ -33,14 +33,14 @@ flowchart TD
 
 ### Single-pass flow
 
-When the document fits in one window (≤250 lines, ~24k tokens), Jev gets one request with two questions:
+When the document fits in one window (≤250 lines, ~14k tokens, under the 60k-character state limit), Jev gets one request with two questions:
 - **where** (Choice): which line ID contains the answer? Each line is an option with `null` criteria.
 - **exists** (Noul): does any line address this question?
 
 ### Two-pass flow
 
 For longer documents:
-1. **Section pass**: Jev gets the section outline and selects which sections are likely to contain the answer. Code keeps top sections until cumulative probability reaches 0.9 (max 3), skipping `none`.
+1. **Section pass**: Jev gets the section outline and selects which sections are likely to contain the answer (sent as a `where` Choice over section IDs). Code keeps top sections until cumulative probability reaches 0.9 (max 3), skipping `none`.
 2. **Line pass**: Jev runs `where` + `exists` on each kept section. Code combines: `relevance = p(section) × p(line)`, `exists = max` over windows.
 
 ### Verdict policy
@@ -101,15 +101,25 @@ The app works with no API keys and no network:
 
 ### Edge Functions
 
-1. **`jev-search`** — Proxies Jev API calls. Pins model `jev-1.13.0`. Retries 429/529 with exponential backoff.
-2. **`answer`** — LLM writer. Takes query, verdict, and top lines with neighbors. Answers only from provided lines with `[Lxxxx]` citations.
-3. **`embed-search`** — Baseline. Calls OpenAI embeddings in batches of 100, computes cosine similarity, returns top 8 lines.
+1. **`jev-search`** — Calls Jev. Pins model `jev-1.13.0` server-side and accepts only a string `state` (≤60k chars) plus `where`/`exists` questions; anything else is a 400. Retries 429/529 with exponential backoff.
+2. **`answer`** — LLM writer. Takes query, verdict, and top lines with neighbors (size-capped). Answers only from provided lines with `[Lxxxx]` citations.
+3. **`embed-search`** — Baseline. Uses only `OPENAI_EMBED_MODEL` (a `model` in the request is ignored), ≤2,000 lines. Calls OpenAI embeddings in batches of 100, computes cosine similarity, returns top 8 lines.
+4. **`persist`** — Insert-only writes for `documents` (`save_document`, size-limited, returns the id) and `searches` (`save_search`, the document must exist). No AI calls.
+
+All functions have `verify_jwt = true` and read URLs, keys and models only from env.
+
+### Daily demo cap
+
+Every paid upstream fetch (each Jev attempt including retries, each embeddings request/batch, each LLM call) first calls `increment_usage` (service role only). The cap is 200 calls/day for the whole app. Over the cap the function returns 429 `{"error":"Daily demo limit reached - showing offline results","demo":true}`; if the counter can't be checked it fails closed with 503 and the same body. The browser then shows a notice and uses recorded replay / BM25 / extractive answers.
 
 ### Database Schema
 
 - `documents` — loaded documents with tagged lines and section outlines
 - `searches` — search results for stats and replay
 - `line_embeddings` — cached embeddings per document + model
+- `usage_counters` — per-day call counts for the demo cap (no client access)
+
+The browser has read-only (SELECT) access to `documents`, `searches` and `line_embeddings`; all writes go through `persist`.
 
 ## Design Decisions
 

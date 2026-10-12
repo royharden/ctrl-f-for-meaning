@@ -6,11 +6,13 @@ import type {
   DocLine,
   JevRequest,
   JevResponse,
+  SearchRecord,
 } from '@/types';
 import {
   JEV_MODEL,
   JEV_COST_PER_M_INPUT,
   EMBED_COST_PER_M_INPUT,
+  MAX_EMBED_LINES,
 } from '@/types';
 import { FunctionsHttpError, FunctionsRelayError, FunctionsFetchError } from '@supabase/supabase-js';
 import {
@@ -52,10 +54,28 @@ interface JevApiResponse {
   usage: { input_tokens: number; output_tokens: number };
 }
 
+export const DEMO_LIMIT_MESSAGE = 'Daily demo limit reached - showing offline results';
+
+/** The daily demo cap was hit (or the cap check failed closed): no paid call was made. */
+export class DemoLimitError extends Error {
+  readonly demo = true;
+  constructor(message = DEMO_LIMIT_MESSAGE) {
+    super(message);
+    this.name = 'DemoLimitError';
+  }
+}
+
+export function isDemoLimitError(err: unknown): err is DemoLimitError {
+  return err instanceof DemoLimitError;
+}
+
 async function extractEdgeError(error: unknown): Promise<Error> {
   if (error instanceof FunctionsHttpError) {
     try {
       const body = await error.context.json();
+      if (body?.demo === true) {
+        return new DemoLimitError(typeof body.error === 'string' ? body.error : DEMO_LIMIT_MESSAGE);
+      }
       if (body?.error) return new Error(body.error);
       return new Error(`Edge function returned HTTP ${error.context.status}`);
     } catch {
@@ -165,11 +185,13 @@ async function callJevSearch(payload: JevSearchPayload): Promise<SearchResult> {
       options: sectionOptions,
     };
 
+    // jev-search only accepts `where`/`exists` questions, so the section pass
+    // is sent as a `where` choice over section IDs.
     const sectionBody = {
       model: JEV_MODEL,
       state: outlineState,
       questions: {
-        section: {
+        where: {
           type: 'choice',
           instructions: sectionReq.instructions,
           criteria: sectionOptions,
@@ -183,16 +205,17 @@ async function callJevSearch(payload: JevSearchPayload): Promise<SearchResult> {
 
     if (sectionError) throw await extractEdgeError(sectionError);
     const sectionResp = sectionData as JevApiResponse;
+    const sectionAnswer = sectionResp.answers.where;
     totalInputTokens += sectionResp.usage.input_tokens;
     totalOutputTokens += sectionResp.usage.output_tokens;
     responses.push({
       model: sectionResp.model,
-      answers: sectionResp.answers,
+      answers: { section: sectionAnswer },
       usage: sectionResp.usage,
     });
     requests.push(sectionReq);
 
-    const sectionProbMap = sectionResp.answers.section?.probabilities || {};
+    const sectionProbMap = sectionAnswer?.probabilities || {};
     const sortedSections = sections
       .map((s) => ({ id: s.id, heading: s.heading, probability: sectionProbMap[s.id] || 0 }))
       .sort((a, b) => b.probability - a.probability);
@@ -369,10 +392,12 @@ interface EmbedPayload {
   documentId: string;
   lines: DocLine[];
   query: string;
-  model?: string;
 }
 
 export async function callEmbedSearch(payload: EmbedPayload): Promise<BaselineResult> {
+  if (payload.lines.length > MAX_EMBED_LINES) {
+    throw new Error(`The embeddings baseline supports documents up to ${MAX_EMBED_LINES} lines.`);
+  }
   const startTime = performance.now();
   const { data, error } = await supabase.functions.invoke('embed-search', {
     body: payload,
@@ -402,6 +427,54 @@ export async function callEmbedSearch(payload: EmbedPayload): Promise<BaselineRe
     costUsd: result.costUsd,
     model: result.model,
   };
+}
+
+// Writes go through the `persist` edge function; the browser has read-only
+// access to the tables.
+
+export interface NewDocument {
+  title: string;
+  source: string;
+  isSample: boolean;
+  lines: DocLine[];
+  sections: DocSection[];
+}
+
+/** Inserts a new document row and returns its id. */
+export async function saveDocument(doc: NewDocument): Promise<string> {
+  const { data, error } = await supabase.functions.invoke('persist', {
+    body: {
+      action: 'save_document',
+      document: {
+        title: doc.title,
+        source: doc.source,
+        isSample: doc.isSample,
+        lines: doc.lines,
+        sections: doc.sections,
+      },
+    },
+  });
+  if (error) throw await extractEdgeError(error);
+  const id = (data as { id?: unknown } | null)?.id;
+  if (typeof id !== 'string') throw new Error('The persist service returned an unexpected response.');
+  return id;
+}
+
+export type NewSearch = Omit<SearchRecord, 'id' | 'created_at' | 'baseline'> & {
+  baseline: BaselineResult | Record<string, never>;
+};
+
+/** Inserts a search row for an existing document and returns the stored record. */
+export async function saveSearch(search: NewSearch): Promise<SearchRecord> {
+  const { data, error } = await supabase.functions.invoke('persist', {
+    body: { action: 'save_search', search },
+  });
+  if (error) throw await extractEdgeError(error);
+  const record = (data as { record?: SearchRecord } | null)?.record;
+  if (!record || typeof record.id !== 'string') {
+    throw new Error('The persist service returned an unexpected response.');
+  }
+  return record;
 }
 
 export { callJevSearch };
